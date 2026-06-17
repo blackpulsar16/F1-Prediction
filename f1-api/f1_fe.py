@@ -1,10 +1,57 @@
+"""F1 feature engineering library (shared by all race models).
+
+Provides pure functions that load a FastF1 session and return a pandas
+DataFrame keyed by Driver. Every function applies the same quality filters
+before computing anything:
+
+    - 107% rule: laps slower than 1.07 x session_best are discarded.
+    - Green flag only: TrackStatus == '1' (no yellow, red, SC, VSC).
+    - Clean lap only: PitOutTime and PitInTime must both be NaN.
+    - Defensive short-circuit: a session with no valid data returns a
+      NaN-filled DataFrame instead of raising.
+    - Prefix naming: every output column is prefixed with the session type
+      (fp1_, fp2_, sq_, ...) so DataFrames from different sessions merge safely.
+
+Function groups:
+    - Circuit baseline: best lap delta, clean lap count, compound averages,
+      sector deltas, speed traps, laps on compound.
+    - Long run / race simulation: rolling pace, degradation rate/total,
+      consistency, stint compound, fuel-corrected pace.
+    - Power unit / ERS (2026 regs): ERS efficiency proxy, lift-and-coast,
+      PU deployment asymmetry, speed-trap variance.
+    - FP3 / setup tuning: qualy-sim delta, FP3 vs FP2 improvement,
+      track evolution.
+    - Qualifying: Q1/Q2/Q3 deltas, Q3 participation, best relative sector.
+    - Grid position: race start order with Q -> SQ -> R fallback.
+    - Teammate and season-form deltas.
+"""
+
 import fastf1
 import pandas as pd
 import numpy as np
 
 fastf1.Cache.enable_cache('./f1_cache')
 
-# CIRCUITO
+def _keep_representative_laps(valid_laps: pd.DataFrame, factor: float = 1.07) -> pd.DataFrame:
+    """Drop in/out/aborted laps from already compound/green/pit-filtered long-run laps.
+
+    A fixed 107% gate against the session's fastest lap (typically a low-fuel
+    qualifying simulation) wrongly discards legitimate high-fuel long-run laps,
+    which are naturally several percent slower. Instead, within each driver-stint
+    keep only laps within ``factor`` of that stint's own median lap time. This
+    adapts to fuel load and tyre age and removes only true outliers (in/out laps,
+    spins, lift-and-coast aborts).
+    """
+    if valid_laps.empty or "Stint" not in valid_laps.columns:
+        return valid_laps
+    df = valid_laps.assign(_lt_s=valid_laps["LapTime"].dt.total_seconds())
+    grp = df.groupby(["Driver", "Stint"])["_lt_s"]
+    med = grp.transform("median")
+    size = grp.transform("size")
+    keep = (size < 3) | (df["_lt_s"] <= med * factor)
+    return df[keep].drop(columns="_lt_s")
+
+
 def get_best_lap_delta(year: int, gp: str, session_type: str) -> pd.DataFrame:
     """
     Calculates best_lap_delta for all drivers dynamically based on session_type:
@@ -18,7 +65,6 @@ def get_best_lap_delta(year: int, gp: str, session_type: str) -> pd.DataFrame:
     prefix = session_type.lower()
     laps = session.laps.copy()
 
-    # Quality filters
     laps = laps[
         (laps['TrackStatus'] == '1')
         & (laps['PitOutTime'].isna())
@@ -27,7 +73,6 @@ def get_best_lap_delta(year: int, gp: str, session_type: str) -> pd.DataFrame:
         & (laps['LapTime'] > pd.Timedelta(0))
     ]
 
-    # Best lap per driver
     driver_best = (
         laps.groupby('Driver')['LapTime']
         .min()
@@ -35,17 +80,14 @@ def get_best_lap_delta(year: int, gp: str, session_type: str) -> pd.DataFrame:
         .rename(columns={'LapTime': 'driver_best_laptime'})
     )
 
-    # Field reference lap
     field_best = driver_best['driver_best_laptime'].min()
 
-    # Relative Delta
     driver_best['field_best_laptime'] = field_best
     driver_best[f'{prefix}_best_lap_delta'] = (
         (driver_best['driver_best_laptime'] - field_best).dt.total_seconds() 
         / field_best.total_seconds()
     )
 
-    # Convert times to seconds for ML models
     driver_best[f'{prefix}_driver_best_laptime_s'] = driver_best['driver_best_laptime'].dt.total_seconds()
     driver_best[f'{prefix}_field_best_laptime_s'] = field_best.total_seconds()
 
@@ -77,7 +119,6 @@ def get_clean_laps_count(year: int, gp: str, session_type: str) -> pd.DataFrame:
 
     result = clean_laps.groupby('Driver').size().reset_index(name=f'{prefix}_clean_laps_count')
 
-    # Include drivers with 0 clean laps
     all_drivers = session.laps['Driver'].unique()
     result = (
         pd.DataFrame({'Driver': all_drivers})
@@ -115,11 +156,9 @@ def get_compound_avg(year: int, gp: str, session_type: str, compound: str = 'HAR
 
     target_laps['LapTime_s'] = target_laps['LapTime'].dt.total_seconds()
 
-    # Normalize by tyre life (generic degradation correction)
     DEG_CORRECTION = 0.08 
     target_laps['LapTime_corrected'] = target_laps['LapTime_s'] - (target_laps['TyreLife'] * DEG_CORRECTION)
 
-    # Filter drivers with at least 3 valid laps
     counts = target_laps.groupby('Driver')['LapTime_s'].count()
     valid_drivers = counts[counts >= 3].index
     target_laps = target_laps[target_laps['Driver'].isin(valid_drivers)]
@@ -166,23 +205,19 @@ def get_sector_deltas(year: int, gp: str, session_type: str) -> pd.DataFrame:
         & (laps['LapTime'] <= max_acceptable_lap)
     ].copy()
 
-    # Convert Timedeltas to seconds safely
     for sec in [1, 2, 3]:
         valid_laps[f'S{sec}_s'] = valid_laps[f'Sector{sec}Time'].dt.total_seconds()
 
-    # Aggregate times
     driver_stats = valid_laps.groupby('Driver').agg(
         s1_avg=('S1_s', 'mean'), s1_best=('S1_s', 'min'),
         s2_avg=('S2_s', 'mean'), s2_best=('S2_s', 'min'),
         s3_avg=('S3_s', 'mean'), s3_best=('S3_s', 'min')
     ).reset_index()
 
-    # Calculate global deltas per sector
     for sec in [1, 2, 3]:
         best_sec = driver_stats[f's{sec}_best'].min()
         driver_stats[f'{prefix}_sector{sec}_delta'] = driver_stats[f's{sec}_avg'] - best_sec
 
-    # Filter columns to return
     cols_to_keep = ['Driver', f'{prefix}_sector1_delta', f'{prefix}_sector2_delta', f'{prefix}_sector3_delta']
     driver_stats = driver_stats[cols_to_keep]
 
@@ -267,7 +302,6 @@ def get_laps_on_compound(year: int, gp: str, session_type: str, compound: str = 
 
     return result.sort_values(f'{prefix}_laps_on_{comp_lower}', ascending=False).reset_index(drop=True)
 
-# LONG RUN
 def get_longrun_avg_pace(year: int, gp: str, session_type: str, compound: str = 'MEDIUM', window_size: int = 8) -> pd.DataFrame:
     """
     Calculates the normalized average pace of the best N strictly consecutive laps 
@@ -286,11 +320,9 @@ def get_longrun_avg_pace(year: int, gp: str, session_type: str, compound: str = 
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Calculate 107% rule threshold based on the overall best lap time
     best_lap_time = laps['LapTime'].min()
     max_acceptable_lap = best_lap_time * 1.07
 
-    # Apply quality filters for clean laps
     valid_laps = laps[
         (laps['Compound'] == compound.upper())
         & (laps['TrackStatus'] == '1')
@@ -298,20 +330,17 @@ def get_longrun_avg_pace(year: int, gp: str, session_type: str, compound: str = 
         & (laps['PitInTime'].isna())
         & (laps['LapTime'].notna())
         & (laps['LapTime'] > pd.Timedelta(0))
-        & (laps['LapTime'] <= max_acceptable_lap)
     ].copy()
 
-    # DEFENSIVE CHECK: If no laps meet the criteria (e.g., Qualifying session), 
-    # short-circuit and return NaNs to prevent pandas apply() crashes on empty DataFrames.
+    valid_laps = _keep_representative_laps(valid_laps)
+
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_name] = np.nan
         return result
 
-    # Convert Timedeltas to seconds
     valid_laps['LapTime_s'] = valid_laps['LapTime'].dt.total_seconds()
 
-    # Dynamic Tyre Degradation Correction
     if compound.upper() == 'SOFT':
         deg_correction = 0.12
     elif compound.upper() == 'HARD':
@@ -319,10 +348,8 @@ def get_longrun_avg_pace(year: int, gp: str, session_type: str, compound: str = 
     else:
         deg_correction = 0.08 
 
-    # Normalize lap times
     valid_laps['LapTime_corrected'] = valid_laps['LapTime_s'] - (valid_laps['TyreLife'] * deg_correction)
 
-    # Sort strictly
     valid_laps = valid_laps.sort_values(by=['Driver', 'Stint', 'LapNumber'])
 
     def get_best_consecutive_window(df: pd.DataFrame, window: int) -> pd.Series:
@@ -348,7 +375,6 @@ def get_longrun_avg_pace(year: int, gp: str, session_type: str, compound: str = 
         .reset_index()
     )
 
-    # Edge-case fallback: if Pandas still stripped the column somehow
     if col_name not in stint_stats.columns:
         stint_stats[col_name] = np.nan
 
@@ -383,11 +409,9 @@ def get_longrun_deg_rate(year: int, gp: str, session_type: str, compound: str = 
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Calculate 107% rule threshold to filter out heavily aborted laps
     best_lap_time = laps['LapTime'].min()
     max_acceptable_lap = best_lap_time * 1.07
 
-    # Apply quality filters
     valid_laps = laps[
         (laps['Compound'] == compound.upper())
         & (laps['TrackStatus'] == '1')
@@ -395,58 +419,46 @@ def get_longrun_deg_rate(year: int, gp: str, session_type: str, compound: str = 
         & (laps['PitInTime'].isna())
         & (laps['LapTime'].notna())
         & (laps['LapTime'] > pd.Timedelta(0))
-        & (laps['LapTime'] <= max_acceptable_lap)
     ].copy()
 
-    # DEFENSIVE CHECK: Short-circuit if session has no valid data (e.g., Qualifying)
+    valid_laps = _keep_representative_laps(valid_laps)
+
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_name] = np.nan
         return result
 
-    # Convert Timedeltas to seconds
     valid_laps['LapTime_s'] = valid_laps['LapTime'].dt.total_seconds()
     valid_laps = valid_laps.sort_values(by=['Driver', 'Stint', 'LapNumber'])
 
     def calculate_deg_slope(df: pd.DataFrame) -> pd.Series:
-        # Require a minimum number of valid laps to establish a reliable trend
         if len(df) < min_laps:
             return pd.Series({col_name: np.nan, 'laps_in_stint': len(df)})
             
-        # x: Tire age (number of laps old)
-        # y: Lap time in seconds
         x = df['TyreLife'].values
         y = df['LapTime_s'].values
         
-        # Calculate linear regression (degree 1 polynomial)
-        # polyfit returns [slope, intercept]
         slope, _ = np.polyfit(x, y, 1)
         
         return pd.Series({col_name: slope, 'laps_in_stint': len(df)})
 
-    # Apply the slope calculation per stint
     stint_stats = (
         valid_laps.groupby(['Driver', 'Stint'])
         .apply(calculate_deg_slope, include_groups=False)
         .reset_index()
     )
 
-    # Edge-case fallback
     if col_name not in stint_stats.columns:
         stint_stats[col_name] = np.nan
         stint_stats['laps_in_stint'] = 0
 
-    # Filter out invalid stints (those that returned NaN slope)
     valid_stints = stint_stats.dropna(subset=[col_name])
 
-    # If no stints passed the min_laps threshold, return NaNs
     if valid_stints.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_name] = np.nan
         return result
 
-    # If a driver did multiple long runs, select the one with the most laps 
-    # to get the most statistically significant degradation rate
     best_stints = (
         valid_stints.sort_values(['Driver', 'laps_in_stint'], ascending=[True, False])
         .drop_duplicates('Driver')
@@ -454,13 +466,11 @@ def get_longrun_deg_rate(year: int, gp: str, session_type: str, compound: str = 
 
     driver_stats = best_stints[['Driver', col_name]]
 
-    # Reintegrate all drivers
     result = (
         pd.DataFrame({'Driver': all_drivers})
         .merge(driver_stats, on='Driver', how='left')
     )
 
-    # Sort from best degradation (lowest slope) to worst (highest slope)
     return result.sort_values(col_name).reset_index(drop=True)
 
 def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str = 'MEDIUM', min_laps: int = 5, expected_stint_length: int = 15) -> pd.DataFrame:
@@ -482,11 +492,9 @@ def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str =
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Calculate 107% rule threshold
     best_lap_time = laps['LapTime'].min()
     max_acceptable_lap = best_lap_time * 1.07
 
-    # Apply quality filters
     valid_laps = laps[
         (laps['Compound'] == compound.upper())
         & (laps['TrackStatus'] == '1')
@@ -494,10 +502,10 @@ def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str =
         & (laps['PitInTime'].isna())
         & (laps['LapTime'].notna())
         & (laps['LapTime'] > pd.Timedelta(0))
-        & (laps['LapTime'] <= max_acceptable_lap)
     ].copy()
 
-    # DEFENSIVE CHECK: Short-circuit if session has no valid data
+    valid_laps = _keep_representative_laps(valid_laps)
+
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_rate] = np.nan
@@ -518,10 +526,8 @@ def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str =
         x = df['TyreLife'].values
         y = df['LapTime_s'].values
         
-        # Calculate linear regression slope (seconds per lap)
         slope, _ = np.polyfit(x, y, 1)
         
-        # Extrapolate to the expected stint length
         deg_total = slope * expected_stint_length
         
         return pd.Series({
@@ -530,14 +536,12 @@ def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str =
             'laps_in_stint': len(df)
         })
 
-    # Apply calculations per stint
     stint_stats = (
         valid_laps.groupby(['Driver', 'Stint'])
         .apply(calculate_deg_metrics, include_groups=False)
         .reset_index()
     )
 
-    # Edge-case fallback
     if col_total not in stint_stats.columns:
         stint_stats[col_rate] = np.nan
         stint_stats[col_total] = np.nan
@@ -551,7 +555,6 @@ def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str =
         result[col_total] = np.nan
         return result
 
-    # Select the most reliable stint (the one with the most laps)
     best_stints = (
         valid_stints.sort_values(['Driver', 'laps_in_stint'], ascending=[True, False])
         .drop_duplicates('Driver')
@@ -559,13 +562,11 @@ def get_longrun_deg_total(year: int, gp: str, session_type: str, compound: str =
 
     driver_stats = best_stints[['Driver', col_rate, col_total]]
 
-    # Reintegrate all drivers
     result = (
         pd.DataFrame({'Driver': all_drivers})
         .merge(driver_stats, on='Driver', how='left')
     )
 
-    # Sort from least total time lost to most
     return result.sort_values(col_total).reset_index(drop=True)
 
 def get_longrun_consistency(year: int, gp: str, session_type: str, compound: str = 'MEDIUM', min_laps: int = 5) -> pd.DataFrame:
@@ -588,11 +589,9 @@ def get_longrun_consistency(year: int, gp: str, session_type: str, compound: str
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Calculate 107% rule threshold
     best_lap_time = laps['LapTime'].min()
     max_acceptable_lap = best_lap_time * 1.07
 
-    # Apply quality filters
     valid_laps = laps[
         (laps['Compound'] == compound.upper())
         & (laps['TrackStatus'] == '1')
@@ -600,19 +599,17 @@ def get_longrun_consistency(year: int, gp: str, session_type: str, compound: str
         & (laps['PitInTime'].isna())
         & (laps['LapTime'].notna())
         & (laps['LapTime'] > pd.Timedelta(0))
-        & (laps['LapTime'] <= max_acceptable_lap)
     ].copy()
 
-    # DEFENSIVE CHECK: Short-circuit if session has no valid data
+    valid_laps = _keep_representative_laps(valid_laps)
+
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_name] = np.nan
         return result
 
-    # Convert Timedeltas to seconds
     valid_laps['LapTime_s'] = valid_laps['LapTime'].dt.total_seconds()
 
-    # Dynamic Tyre Degradation Correction to detrend the data
     if compound.upper() == 'SOFT':
         deg_correction = 0.12
     elif compound.upper() == 'HARD':
@@ -624,24 +621,19 @@ def get_longrun_consistency(year: int, gp: str, session_type: str, compound: str
     valid_laps = valid_laps.sort_values(by=['Driver', 'Stint', 'LapNumber'])
 
     def calculate_std_dev(df: pd.DataFrame) -> pd.Series:
-        # Require a minimum number of valid laps for statistical significance
         if len(df) < min_laps:
             return pd.Series({col_name: np.nan, 'laps_in_stint': len(df)})
             
-        # Calculate the sample standard deviation (ddof=1 is default in Pandas)
-        # of the detrended lap times.
         consistency = df['LapTime_corrected'].std()
         
         return pd.Series({col_name: consistency, 'laps_in_stint': len(df)})
 
-    # Apply calculations per stint
     stint_stats = (
         valid_laps.groupby(['Driver', 'Stint'])
         .apply(calculate_std_dev, include_groups=False)
         .reset_index()
     )
 
-    # Edge-case fallback
     if col_name not in stint_stats.columns:
         stint_stats[col_name] = np.nan
         stint_stats['laps_in_stint'] = 0
@@ -653,8 +645,6 @@ def get_longrun_consistency(year: int, gp: str, session_type: str, compound: str
         result[col_name] = np.nan
         return result
 
-    # Select the stint with the most laps. If tied, pick the one where the driver 
-    # was most consistent (lowest standard deviation).
     best_stints = (
         valid_stints.sort_values(['Driver', 'laps_in_stint', col_name], ascending=[True, False, True])
         .drop_duplicates('Driver')
@@ -662,13 +652,11 @@ def get_longrun_consistency(year: int, gp: str, session_type: str, compound: str
 
     driver_stats = best_stints[['Driver', col_name]]
 
-    # Reintegrate all drivers
     result = (
         pd.DataFrame({'Driver': all_drivers})
         .merge(driver_stats, on='Driver', how='left')
     )
 
-    # Sort from most consistent (lowest standard deviation) to most erratic
     return result.sort_values(col_name).reset_index(drop=True)
 
 def get_longrun_compound(year: int, gp: str, session_type: str, min_laps: int = 5) -> pd.DataFrame:
@@ -689,53 +677,45 @@ def get_longrun_compound(year: int, gp: str, session_type: str, min_laps: int = 
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Calculate 107% rule threshold
     best_lap_time = laps['LapTime'].min()
     max_acceptable_lap = best_lap_time * 1.07
 
-    # Apply quality filters to count only representative laps
     valid_laps = laps[
         (laps['TrackStatus'] == '1')
         & (laps['PitOutTime'].isna())
         & (laps['PitInTime'].isna())
         & (laps['LapTime'].notna())
         & (laps['LapTime'] > pd.Timedelta(0))
-        & (laps['LapTime'] <= max_acceptable_lap)
-        & (laps['Compound'].notna())  # Ensure compound data is logged
+        & (laps['Compound'].notna())
     ].copy()
 
-    # DEFENSIVE CHECK: Short-circuit if session has no valid data (e.g., Qualifying)
+    valid_laps = _keep_representative_laps(valid_laps)
+
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_compound] = np.nan
         result[col_laps] = 0
         return result
 
-    # Group by Driver, Stint, and Compound to count valid laps per stint
     stint_stats = (
         valid_laps.groupby(['Driver', 'Stint', 'Compound'])
         .agg(laps_in_stint=('LapTime', 'count'))
         .reset_index()
     )
 
-    # Filter out short runs (e.g., scrubbed tires, qualy sims)
     valid_stints = stint_stats[stint_stats['laps_in_stint'] >= min_laps].copy()
 
-    # If no stints passed the minimum laps threshold
     if valid_stints.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_compound] = np.nan
         result[col_laps] = 0
         return result
 
-    # Sort to prioritize the stint with the maximum number of laps per driver
-    # drop_duplicates keeps only the top row (longest stint) for each driver
     best_stints = (
         valid_stints.sort_values(['Driver', 'laps_in_stint'], ascending=[True, False])
         .drop_duplicates('Driver')
     )
 
-    # Rename columns for the final dataset
     driver_stats = best_stints[['Driver', 'Compound', 'laps_in_stint']].rename(
         columns={
             'Compound': col_compound,
@@ -743,7 +723,6 @@ def get_longrun_compound(year: int, gp: str, session_type: str, min_laps: int = 
         }
     )
 
-    # Reintegrate all drivers, leaving NaN for those without a long run
     result = (
         pd.DataFrame({'Driver': all_drivers})
         .merge(driver_stats, on='Driver', how='left')
@@ -752,7 +731,6 @@ def get_longrun_compound(year: int, gp: str, session_type: str, min_laps: int = 
     
     result[col_laps] = result[col_laps].astype(int)
 
-    # Sort from longest stint to shortest
     return result.sort_values(col_laps, ascending=False).reset_index(drop=True)
 
 def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str = 'MEDIUM', window_size: int = 5) -> pd.DataFrame:
@@ -775,11 +753,9 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # 107% rule threshold
     best_lap_time = laps['LapTime'].min()
     max_acceptable_lap = best_lap_time * 1.07
 
-    # Quality filters
     valid_laps = laps[
         (laps['Compound'] == compound.upper())
         & (laps['TrackStatus'] == '1')
@@ -787,8 +763,9 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
         & (laps['PitInTime'].isna())
         & (laps['LapTime'].notna())
         & (laps['LapTime'] > pd.Timedelta(0))
-        & (laps['LapTime'] <= max_acceptable_lap)
     ].copy()
+
+    valid_laps = _keep_representative_laps(valid_laps)
 
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
@@ -798,10 +775,9 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
 
     valid_laps['LapTime_s'] = valid_laps['LapTime'].dt.total_seconds()
     
-    # ── Parámetros Físicos F1 ───────────────────────────────────────────────
-    FUEL_CONSUMPTION_PER_LAP = 1.5  # kg burned per lap
-    FUEL_MARGIN_KG = 5.0            # safety margin in the tank
-    FUEL_PENALTY_PER_KG = 0.03      # seconds lost per kg (0.3s per 10kg)
+    FUEL_CONSUMPTION_PER_LAP = 1.5
+    FUEL_MARGIN_KG = 5.0
+    FUEL_PENALTY_PER_KG = 0.03
     
     if compound.upper() == 'SOFT':
         deg_correction = 0.12
@@ -810,36 +786,28 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
     else:
         deg_correction = 0.08 
 
-    # Sort to ensure chronological order within stints
     valid_laps = valid_laps.sort_values(by=['Driver', 'Stint', 'LapNumber'])
 
     def calculate_true_base_pace(df: pd.DataFrame) -> pd.Series:
         if len(df) < window_size:
             return pd.Series({col_pace: np.nan, col_est_fuel: np.nan})
             
-        # Estimate how much fuel they must have started with based on stint length
         total_stint_laps = len(df)
         start_fuel_kg = (total_stint_laps * FUEL_CONSUMPTION_PER_LAP) + FUEL_MARGIN_KG
         
-        # Calculate lap-by-lap fuel weight and remove both tire and fuel penalties
-        # Enumerate gives us the lap index (0, 1, 2...) within the valid stint
         corrected_lap_times = []
         for i, row in enumerate(df.itertuples()):
             current_fuel_kg = start_fuel_kg - (i * FUEL_CONSUMPTION_PER_LAP)
             
-            # Time lost due to the weight of fuel
             fuel_time_penalty = current_fuel_kg * FUEL_PENALTY_PER_KG
             
-            # Time lost due to tire age
             tire_time_penalty = row.TyreLife * deg_correction
             
-            # The theoretical lap time if the car had 0kg fuel and brand new tires
             lap_time_0kg = row.LapTime_s - tire_time_penalty - fuel_time_penalty
             corrected_lap_times.append(lap_time_0kg)
             
         df_calc = pd.DataFrame({'LapTime_0kg': corrected_lap_times, 'LapNumber': df['LapNumber'].values})
         
-        # Find the best consecutive window of True Pace
         rolling_avg = df_calc['LapTime_0kg'].rolling(window=window_size).mean()
         
         rolling_lap_max = df_calc['LapNumber'].rolling(window=window_size).max()
@@ -856,7 +824,6 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
             col_est_fuel: start_fuel_kg
         })
 
-    # Apply calculations per stint
     stint_stats = (
         valid_laps.groupby(['Driver', 'Stint'])
         .apply(calculate_true_base_pace, include_groups=False)
@@ -870,8 +837,8 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
     driver_stats = (
         stint_stats.groupby('Driver')
         .agg({
-            col_pace: 'min',       # Take their absolute best 0kg pace
-            col_est_fuel: 'max'    # Take the fuel load from their longest stint
+            col_pace: 'min',
+            col_est_fuel: 'max'
         })
         .reset_index()
     )
@@ -881,7 +848,6 @@ def get_fuel_corrected_pace(year: int, gp: str, session_type: str, compound: str
         .merge(driver_stats, on='Driver', how='left')
     )
 
-    # Sort from fastest Base Pace (lowest time) to slowest
     return result.sort_values(col_pace).reset_index(drop=True)
 
 def get_ers_efficiency_proxy(year: int, gp: str, session_type: str) -> pd.DataFrame:
@@ -894,7 +860,6 @@ def get_ers_efficiency_proxy(year: int, gp: str, session_type: str) -> pd.DataFr
     Negative proxy = Inefficient (heavy braking, potentially clipping or poor traction).
     """
     session = fastf1.get_session(year, gp, session_type)
-    # TELEMETRY MUST BE TRUE FOR THIS FUNCTION
     session.load(telemetry=True, weather=False, messages=False)
     
     prefix = session_type.lower()
@@ -910,7 +875,6 @@ def get_ers_efficiency_proxy(year: int, gp: str, session_type: str) -> pd.DataFr
         if drv_laps.empty:
             continue
             
-        # Get the absolute fastest lap for the driver to see maximum ERS mapping
         best_lap = drv_laps.loc[drv_laps['LapTime'].idxmin()]
         
         try:
@@ -921,17 +885,13 @@ def get_ers_efficiency_proxy(year: int, gp: str, session_type: str) -> pd.DataFr
         if tel.empty:
             continue
 
-        # Calculate time elapsed between each telemetry sample (typically 0.001s - 0.05s)
         tel['Time_delta'] = tel['Time'].dt.total_seconds().diff().fillna(0)
 
-        # MGU-K Recovery Phase: Time spent with brake pedal applied
         braking_time = tel.loc[tel['Brake'] > 0, 'Time_delta'].sum()
 
-        # ERS Deployment Phase: Time spent essentially at full throttle (>95%)
         accel_time = tel.loc[tel['Throttle'] >= 95, 'Time_delta'].sum()
 
         if braking_time > 0:
-            # Raw ratio of Deploy vs Recovery
             ers_ratio = accel_time / braking_time
         else:
             ers_ratio = np.nan
@@ -948,19 +908,14 @@ def get_ers_efficiency_proxy(year: int, gp: str, session_type: str) -> pd.DataFr
     if df.empty:
         return df
 
-    # Calculate field median to establish the baseline
     median_ratio = df['ers_ratio_raw'].median()
     
-    # Calculate the Proxy: Deviation from the field average
-    # Positive means more efficient than average, negative means less efficient
     df[col_proxy] = df['ers_ratio_raw'] - median_ratio
 
-    # Sort from most efficient to least efficient
     df = df.sort_values(col_proxy, ascending=False).reset_index(drop=True)
     
     return df[['Driver', 'braking_time_s', 'full_throttle_time_s', col_proxy]]
 
-##METRICAS 2026
 def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_laps: int = 5) -> pd.DataFrame:
     """
     Calculates the average time (in seconds) per lap a driver spends doing 'Lift & Coast' 
@@ -970,7 +925,6 @@ def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_l
     High values indicate battery starvation, severe fuel saving, or PU thermal management.
     """
     session = fastf1.get_session(year, gp, session_type)
-    # Telemetry must be loaded for pedal inputs
     session.load(telemetry=True, weather=False, messages=False)
     
     prefix = session_type.lower()
@@ -979,7 +933,6 @@ def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_l
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
     
-    # Filter for valid racing laps (long runs)
     valid_laps = laps[
         (laps['TrackStatus'] == '1') & 
         (laps['PitOutTime'].isna()) & 
@@ -992,7 +945,6 @@ def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_l
         result = pd.DataFrame({'Driver': all_drivers, col_lc_time: np.nan})
         return result
 
-    # Identify the longest stint for each driver
     stint_counts = valid_laps.groupby(['Driver', 'Stint']).size()
     long_runs = stint_counts[stint_counts >= min_laps].reset_index()
     
@@ -1005,7 +957,6 @@ def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_l
             results.append({'Driver': drv, col_lc_time: np.nan})
             continue
             
-        # Select their primary long run
         best_stint = drv_long_runs.sort_values(0, ascending=False).iloc[0]['Stint']
         drv_laps = valid_laps[(valid_laps['Driver'] == drv) & (valid_laps['Stint'] == best_stint)]
         
@@ -1020,7 +971,6 @@ def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_l
                     
                 tel['Time_delta'] = tel['Time'].dt.total_seconds().diff().fillna(0)
                 
-                # The Physical Rule for Lift & Coast
                 lc_mask = (tel['Speed'] > 250) & (tel['Throttle'] < 20) & (tel['Brake'] == 0)
                 lap_lc_time = tel.loc[lc_mask, 'Time_delta'].sum()
                 
@@ -1038,7 +988,6 @@ def get_lift_and_coast_laps(year: int, gp: str, session_type: str = 'FP2', min_l
         
     df = pd.DataFrame(results)
     
-    # Sort from highest L&C (most conservative/starved) to lowest (flat out)
     return df.sort_values(col_lc_time, ascending=False).reset_index(drop=True)
 
 def get_pu_deployment_asymmetry(year: int, gp: str, session_type: str = 'FP2') -> pd.DataFrame:
@@ -1061,7 +1010,6 @@ def get_pu_deployment_asymmetry(year: int, gp: str, session_type: str = 'FP2') -
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Filter for valid push laps without pit stops
     valid_laps = laps[
         (laps['TrackStatus'] == '1')
         & (laps['PitOutTime'].isna())
@@ -1077,26 +1025,18 @@ def get_pu_deployment_asymmetry(year: int, gp: str, session_type: str = 'FP2') -
         result[col_asymmetry] = np.nan
         return result
 
-    # Find the absolute best lap for each driver to see maximum PU deployment
     best_idx = valid_laps.groupby('Driver')['LapTime'].idxmin()
     best_laps = valid_laps.loc[best_idx].copy()
     
-    # Convert timedelta to purely numerical seconds for ML algorithms
     best_laps[col_s1] = best_laps['Sector1Time'].dt.total_seconds()
     best_laps[col_s3] = best_laps['Sector3Time'].dt.total_seconds()
     
-    # Calculate the raw ratio (S1 Time / S3 Time)
     best_laps[col_ratio] = best_laps[col_s1] / best_laps[col_s3]
     
-    # Calculate field median to establish the baseline strategy
     median_ratio = best_laps[col_ratio].median()
     
-    # Calculate asymmetry (deviation from the field's median strategy)
-    # Positive delta: Bias towards S3 deployment (slower S1)
-    # Negative delta: Bias towards S1 deployment (slower S3)
     best_laps[col_asymmetry] = best_laps[col_ratio] - median_ratio
 
-    # Keep only the relevant features
     driver_stats = best_laps[['Driver', col_s1, col_s3, col_ratio, col_asymmetry]]
 
     result = (
@@ -1104,7 +1044,6 @@ def get_pu_deployment_asymmetry(year: int, gp: str, session_type: str = 'FP2') -
         .merge(driver_stats, on='Driver', how='left')
     )
 
-    # Sort to group similar engine mapping strategies together
     return result.sort_values(col_asymmetry, ascending=False).reset_index(drop=True)
 
 def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_laps: int = 5) -> pd.DataFrame:
@@ -1116,7 +1055,6 @@ def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_l
     Low variance indicates a perfectly tuned ERS map and predictable race pace.
     """
     session = fastf1.get_session(year, gp, session_type)
-    # Telemetry is strictly required to find the absolute max speed of each lap
     session.load(telemetry=True, weather=False, messages=False)
     
     prefix = session_type.lower()
@@ -1126,7 +1064,6 @@ def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_l
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
     
-    # Filter for valid push laps in the long run
     valid_laps = laps[
         (laps['TrackStatus'] == '1') & 
         (laps['PitOutTime'].isna()) & 
@@ -1137,7 +1074,6 @@ def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_l
     if valid_laps.empty:
         return pd.DataFrame({'Driver': all_drivers, col_std: np.nan, col_mean: np.nan})
 
-    # Identify the longest stint per driver to evaluate race simulation
     stint_counts = valid_laps.groupby(['Driver', 'Stint']).size()
     long_runs = stint_counts[stint_counts >= min_laps].reset_index()
     
@@ -1150,7 +1086,6 @@ def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_l
             results.append({'Driver': drv, col_std: np.nan, col_mean: np.nan})
             continue
             
-        # Select their primary long run
         best_stint = drv_long_runs.sort_values(0, ascending=False).iloc[0]['Stint']
         drv_laps = valid_laps[(valid_laps['Driver'] == drv) & (valid_laps['Stint'] == best_stint)]
         
@@ -1160,13 +1095,11 @@ def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_l
             try:
                 tel = lap.get_telemetry()
                 if not tel.empty:
-                    # Find the absolute maximum speed registered in the telemetry array
                     max_speed = tel['Speed'].max()
                     lap_top_speeds.append(max_speed)
             except Exception:
                 continue
         
-        # Calculate statistical variance metrics if we have enough laps
         if len(lap_top_speeds) > 1:
             speed_std = np.std(lap_top_speeds, ddof=1)
             speed_mean = np.mean(lap_top_speeds)
@@ -1178,10 +1111,8 @@ def get_speed_trap_variance(year: int, gp: str, session_type: str = 'FP2', min_l
         
     df = pd.DataFrame(results)
     
-    # Sort from highest variance (most inconsistent/erratic) to lowest
     return df.sort_values(col_std, ascending=False).reset_index(drop=True)
 
-#fine tuning
 def get_qualy_sim_delta(year: int, gp: str, session_type: str = 'FP3', compound: str = 'SOFT') -> pd.DataFrame:
     """
     Calculates the Qualifying Simulation Delta (in seconds) for each driver.
@@ -1202,7 +1133,6 @@ def get_qualy_sim_delta(year: int, gp: str, session_type: str = 'FP3', compound:
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Apply quality filters for valid push laps (Qualy sims)
     valid_laps = laps[
         (laps['Compound'] == compound.upper())
         & (laps['TrackStatus'] == '1')
@@ -1211,37 +1141,30 @@ def get_qualy_sim_delta(year: int, gp: str, session_type: str = 'FP3', compound:
         & (laps['LapTime'].notna())
     ].copy()
 
-    # DEFENSIVE CHECK: Short-circuit if session was a washout or no valid laps exist
     if valid_laps.empty:
         result = pd.DataFrame({'Driver': all_drivers})
         result[col_laptime] = np.nan
         result[col_delta] = np.nan
         return result
 
-    # Find the absolute best lap time for each driver
     driver_bests = (
         valid_laps.groupby('Driver')['LapTime']
         .min()
         .reset_index()
     )
     
-    # Identify the absolute fastest lap of the entire session
     overall_fastest_lap = driver_bests['LapTime'].min()
 
-    # Calculate metrics in strictly numerical format (seconds) for Machine Learning
     driver_bests[col_laptime] = driver_bests['LapTime'].dt.total_seconds()
     driver_bests[col_delta] = (driver_bests['LapTime'] - overall_fastest_lap).dt.total_seconds()
 
-    # Drop the Timedelta column and prepare final merge
     driver_stats = driver_bests[['Driver', col_laptime, col_delta]]
 
-    # Reintegrate all drivers (those who crashed or didn't run will get NaN)
     result = (
         pd.DataFrame({'Driver': all_drivers})
         .merge(driver_stats, on='Driver', how='left')
     )
 
-    # Sort from fastest (Delta 0.000) to slowest
     return result.sort_values(col_delta).reset_index(drop=True)
 
 def get_fp3_vs_fp2_improvement(year: int, gp: str, compound: str = 'SOFT') -> pd.DataFrame:
@@ -1252,7 +1175,6 @@ def get_fp3_vs_fp2_improvement(year: int, gp: str, compound: str = 'SOFT') -> pd
     A positive value indicates the car got faster (improved setup + track evolution).
     A negative value indicates the car got slower (failed setup, bad correlation, or wet track).
     """
-    # Load both sessions back-to-back
     fp2 = fastf1.get_session(year, gp, 'FP2')
     fp3 = fastf1.get_session(year, gp, 'FP3')
     
@@ -1274,7 +1196,6 @@ def get_fp3_vs_fp2_improvement(year: int, gp: str, compound: str = 'SOFT') -> pd
         if valid_laps.empty:
             return pd.DataFrame({'Driver': session_laps['Driver'].unique(), f'{prefix}_{comp_lower}_best_s': np.nan})
             
-        # Group by driver and find minimum lap time
         best_laps = (
             valid_laps.groupby('Driver')['LapTime']
             .min()
@@ -1283,30 +1204,24 @@ def get_fp3_vs_fp2_improvement(year: int, gp: str, compound: str = 'SOFT') -> pd
         )
         return best_laps.rename(columns={'LapTime': f'{prefix}_{comp_lower}_best_s'})
 
-    # Extract best laps from both sessions
     fp2_bests = get_best_laps(fp2.laps, 'fp2')
     fp3_bests = get_best_laps(fp3.laps, 'fp3')
     
-    # Consolidate all drivers that participated in either session
     all_drivers = pd.Series(
         list(set(fp2.laps['Driver'].unique()).union(set(fp3.laps['Driver'].unique()))), 
         name='Driver'
     )
     df_all = pd.DataFrame(all_drivers)
     
-    # Merge the FP2 and FP3 data into a single DataFrame
     result = (
         df_all
         .merge(fp2_bests, on='Driver', how='left')
         .merge(fp3_bests, on='Driver', how='left')
     )
     
-    # Calculate the Overnight Improvement
-    # Example: FP2 (91.5s) - FP3 (90.5s) = +1.0s (Improved by 1 second)
     col_improvement = f'fp3_vs_fp2_{comp_lower}_improvement'
     result[col_improvement] = result[f'fp2_{comp_lower}_best_s'] - result[f'fp3_{comp_lower}_best_s']
     
-    # Sort by the most improved drivers at the top
     return result.sort_values(col_improvement, ascending=False).reset_index(drop=True)
 
 def get_sector_improvement_vs_fp2(year: int, gp: str, compound: str = 'SOFT') -> pd.DataFrame:
@@ -1342,11 +1257,9 @@ def get_sector_improvement_vs_fp2(year: int, gp: str, compound: str = 'SOFT') ->
         if valid_laps.empty:
             return pd.DataFrame({'Driver': session_laps['Driver'].unique()})
             
-        # Get index of the fastest lap for each driver
         best_idx = valid_laps.groupby('Driver')['LapTime'].idxmin()
         best_laps = valid_laps.loc[best_idx].copy()
         
-        # Extract purely the seconds for ML calculation
         res = pd.DataFrame({
             'Driver': best_laps['Driver'],
             f'{prefix}_s1_s': best_laps['Sector1Time'].dt.total_seconds(),
@@ -1358,7 +1271,6 @@ def get_sector_improvement_vs_fp2(year: int, gp: str, compound: str = 'SOFT') ->
     fp2_sectors = get_best_lap_sectors(fp2.laps, 'fp2')
     fp3_sectors = get_best_lap_sectors(fp3.laps, 'fp3')
     
-    # Consolidate all drivers
     all_drivers = pd.Series(
         list(set(fp2.laps['Driver'].unique()).union(set(fp3.laps['Driver'].unique()))), 
         name='Driver'
@@ -1368,16 +1280,12 @@ def get_sector_improvement_vs_fp2(year: int, gp: str, compound: str = 'SOFT') ->
     df = (df.merge(fp2_sectors, on='Driver', how='left')
             .merge(fp3_sectors, on='Driver', how='left'))
     
-    # Calculate the Delta Improvements (FP2 - FP3)
-    # E.g., FP2 Sector 1 (30.5s) - FP3 Sector 1 (30.0s) = +0.5s improvement
     df['fp3_s1_delta_vs_fp2'] = df['fp2_s1_s'] - df['fp3_s1_s']
     df['fp3_s2_delta_vs_fp2'] = df['fp2_s2_s'] - df['fp3_s2_s']
     df['fp3_s3_delta_vs_fp2'] = df['fp2_s3_s'] - df['fp3_s3_s']
     
-    # Calculate total to sort by the biggest overall improver
     df['total_imp'] = df['fp3_s1_delta_vs_fp2'] + df['fp3_s2_delta_vs_fp2'] + df['fp3_s3_delta_vs_fp2']
     
-    # Clean up output for the final Dataset
     final_cols = ['Driver', 'fp3_s1_delta_vs_fp2', 'fp3_s2_delta_vs_fp2', 'fp3_s3_delta_vs_fp2']
     
     return df.sort_values('total_imp', ascending=False)[final_cols].reset_index(drop=True)
@@ -1417,16 +1325,10 @@ def get_fp3_qualy_sim_context(year: int, gp: str, session_type: str = 'FP3') -> 
     best_idx = valid_laps.groupby('Driver')['LapTime'].idxmin()
     best_laps = valid_laps.loc[best_idx].copy()
 
-    # Feature 1: The Compound
     best_laps[col_tyre] = best_laps['Compound']
     
-    # Feature 2: Physical Degradation (Age of the tyre in laps)
-    # Convert to numeric, handle potential API missing data
     best_laps[col_age] = pd.to_numeric(best_laps['TyreLife'], errors='coerce').fillna(1.0)
     
-    # Feature 3: The True Qualy Sim Flag (Strict ML rule)
-    # A true qualy sim is a SOFT tyre with 3 laps or less of age 
-    # (Out lap + Prep lap + Push lap). Anything older is compromised.
     best_laps[col_true_sim_flag] = (
         (best_laps['Compound'] == 'SOFT') & 
         (best_laps[col_age] <= 3.0)
@@ -1440,7 +1342,7 @@ def get_fp3_qualy_sim_context(year: int, gp: str, session_type: str = 'FP3') -> 
     )
     
     result[col_tyre] = result[col_tyre].fillna('NONE')
-    result[col_age] = result[col_age].fillna(100.0) # Penalize drivers with no data
+    result[col_age] = result[col_age].fillna(100.0)
     result[col_true_sim_flag] = result[col_true_sim_flag].fillna(0).astype(int)
 
     return result
@@ -1463,7 +1365,6 @@ def get_track_evolution(year: int, gp: str, session_type: str = 'FP3') -> pd.Dat
     laps = session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Filter for valid push laps
     valid_laps = laps[
         (laps['TrackStatus'] == '1') &
         (laps['PitOutTime'].isna()) &
@@ -1474,7 +1375,6 @@ def get_track_evolution(year: int, gp: str, session_type: str = 'FP3') -> pd.Dat
     if valid_laps.empty:
         return pd.DataFrame({'Driver': all_drivers, col_evo: np.nan})
 
-    # Divide the session temporally (not by lap numbers, as drivers run at different times)
     session_start = valid_laps['Time'].min()
     session_end = valid_laps['Time'].max()
     midpoint = session_start + (session_end - session_start) / 2
@@ -1485,20 +1385,16 @@ def get_track_evolution(year: int, gp: str, session_type: str = 'FP3') -> pd.Dat
     if early_laps.empty or late_laps.empty:
         track_evo = np.nan
     else:
-        # Convert Timedelta to purely numerical seconds
         best_early_s = early_laps['LapTime'].min().total_seconds()
         best_late_s = late_laps['LapTime'].min().total_seconds()
         
-        # Improvement = Early Lap - Late Lap. (e.g., 92.0s - 90.5s = +1.5s Evolution)
         track_evo = best_early_s - best_late_s
 
-    # Broadcast this global contextual variable to every driver in the dataset
     df = pd.DataFrame({'Driver': all_drivers})
     df[col_evo] = track_evo
 
     return df
 
-#podios
 def get_grid_position_features(year: int, gp: str, session_type: str = 'R') -> pd.DataFrame:
     """
     Extracts the final starting grid positions for the race and creates 
@@ -1509,7 +1405,6 @@ def get_grid_position_features(year: int, gp: str, session_type: str = 'R') -> p
     after all grid penalties have been applied.
     """
     session = fastf1.get_session(year, gp, session_type)
-    # We only need the results table, no telemetry required
     session.load(telemetry=False, weather=False, messages=False)
     
     results = session.results
@@ -1522,26 +1417,15 @@ def get_grid_position_features(year: int, gp: str, session_type: str = 'R') -> p
         'raw_grid': results['GridPosition']
     })
     
-    # Ensure numeric types
     df['raw_grid'] = pd.to_numeric(df['raw_grid'], errors='coerce')
     
-    # Feature 1: Pit Lane Start Flag
-    # FastF1 assigns 0 to pit lane starters. We capture this as a distinct binary event.
     df['started_from_pitlane'] = (df['raw_grid'] == 0).astype(int)
     
-    # Feature 2: Adjusted Grid Position (Ordinal correction)
-    # Models interpret lower numbers as better. A 0 would break the model.
-    # We assign pit lane starters to 21 (behind the grid).
     df['grid_position'] = np.where(df['raw_grid'] == 0, 21, df['raw_grid'])
-    # Handle DNS (Did Not Start) or NaNs by placing them at the back
     df['grid_position'] = df['grid_position'].fillna(21)
     
-    # Feature 3: Front Row Flag
-    # Being in P1 or P2 guarantees clean air into Turn 1. This is a non-linear advantage.
     df['is_front_row'] = (df['grid_position'] <= 2).astype(int)
     
-    # Feature 4: Top 10 Flag (Points Contention)
-    # Starting in the top 10 changes race strategy (e.g., tire choices).
     df['started_top_10'] = (df['grid_position'] <= 10).astype(int)
     
     final_cols = [
@@ -1560,9 +1444,7 @@ def get_qualy_deltas(year: int, gp: str) -> pd.DataFrame:
     Calculates both the strict Q3 delta and an overall Best Qualy delta
     to avoid NaNs for drivers eliminated in Q1/Q2.
     """
-    # Load Qualifying session
     session = fastf1.get_session(year, gp, 'Q')
-    # Official timing is in results; no heavy telemetry needed
     session.load(telemetry=False, weather=False, messages=False)
 
     results = session.results.copy()
@@ -1572,24 +1454,17 @@ def get_qualy_deltas(year: int, gp: str) -> pd.DataFrame:
 
     df = pd.DataFrame({'Driver': results['Abbreviation']})
 
-    # 1. Identify the Pole Time
-    # By FIA rules, Pole is the fastest valid time set in Q3
     pole_time = results['Q3'].min()
     pole_time_s = pole_time.total_seconds()
 
-    # 2. Strict Q3 Delta (Will have NaNs for Q1/Q2 knockouts)
     df['q3_time_s'] = results['Q3'].dt.total_seconds()
     df['q3_delta_to_pole'] = df['q3_time_s'] - pole_time_s
 
-    # 3. ML-Optimized Overall Delta (Fallback feature)
-    # Find the absolute best time for each driver across any phase (Q1, Q2, Q3)
     best_q_times = results[['Q1', 'Q2', 'Q3']].min(axis=1)
     df['best_q_time_s'] = best_q_times.dt.total_seconds()
     
-    # Compare everyone's absolute best lap to the Pole lap
     df['best_q_delta_to_pole'] = df['best_q_time_s'] - pole_time_s
 
-    # 4. Context Label: Where did they get eliminated?
     def get_elimination(row):
         if pd.notna(row['Q3']): return 'Q3'
         if pd.notna(row['Q2']): return 'Q2'
@@ -1662,7 +1537,6 @@ def get_qualy_target_percentile(year: int, gp: str, target_session: str = 'Q') -
         print(f"Error extracting {target_session} for {year} {gp}: {e}")
         return None
 
-    # Cleanup and sort by the closest to pole
     final_cols = ['Driver', 'reached_session', 'q3_delta_to_pole', 'best_q_delta_to_pole']
     return df[final_cols].sort_values('best_q_delta_to_pole').reset_index(drop=True)
 
@@ -1675,7 +1549,6 @@ def get_q3_participation_flag(year: int, gp: str) -> pd.DataFrame:
     This is highly optimized for the first split in Decision Tree models.
     """
     session = fastf1.get_session(year, gp, 'Q')
-    # No telemetry needed, just official classification
     session.load(telemetry=False, weather=False, messages=False)
 
     results = session.results.copy()
@@ -1685,11 +1558,8 @@ def get_q3_participation_flag(year: int, gp: str) -> pd.DataFrame:
 
     df = pd.DataFrame({'Driver': results['Abbreviation']})
 
-    # In FastF1, if a driver didn't reach Q3, their Q3 time is NaT (Not a Time)
-    # We use .notna() to check if they advanced, and .astype(int) turns True/False into 1/0
     df['q3_participation'] = results['Q3'].notna().astype(int)
 
-    # Sort to show the Q3 contenders at the top
     return df.sort_values('q3_participation', ascending=False).reset_index(drop=True)
 
 def get_qualy_vs_fp3_improvement(year: int, gp: str) -> pd.DataFrame:
@@ -1704,11 +1574,9 @@ def get_qualy_vs_fp3_improvement(year: int, gp: str) -> pd.DataFrame:
     fp3 = fastf1.get_session(year, gp, 'FP3')
     q = fastf1.get_session(year, gp, 'Q')
     
-    # Load both sessions. Qualy uses results, FP3 needs laps to find the best time.
     fp3.load(telemetry=False, weather=False, messages=False)
     q.load(telemetry=False, weather=False, messages=False)
     
-    # 1. Get the absolute best valid lap for each driver in FP3
     fp3_laps = fp3.laps.copy()
     valid_fp3 = fp3_laps[
         (fp3_laps['TrackStatus'] == '1') & 
@@ -1723,7 +1591,6 @@ def get_qualy_vs_fp3_improvement(year: int, gp: str) -> pd.DataFrame:
         fp3_bests = valid_fp3.groupby('Driver')['LapTime'].min().dt.total_seconds().reset_index()
         fp3_bests.rename(columns={'LapTime': 'fp3_best_s'}, inplace=True)
         
-    # 2. Get the Qualy times from the official FIA classification
     q_results = q.results.copy()
     if q_results is None or q_results.empty:
         q_times = pd.DataFrame({'Driver': fp3_bests['Driver'].unique(), 'q3_time_s': np.nan, 'best_q_time_s': np.nan})
@@ -1731,21 +1598,16 @@ def get_qualy_vs_fp3_improvement(year: int, gp: str) -> pd.DataFrame:
         q_times = pd.DataFrame({'Driver': q_results['Abbreviation']})
         q_times['q3_time_s'] = q_results['Q3'].dt.total_seconds()
         
-        # ML Armor: Best overall Qualy lap across all phases
         best_q = q_results[['Q1', 'Q2', 'Q3']].min(axis=1)
         q_times['best_q_time_s'] = best_q.dt.total_seconds()
         
-    # 3. Consolidate and Calculate Deltas
     df = pd.merge(fp3_bests, q_times, on='Driver', how='outer')
     
-    # Improvement = FP3 - Qualy. 
-    # E.g., FP3 (91.0s) - Qualy (89.5s) = +1.5s found
     df['q3_vs_fp3_improvement'] = df['fp3_best_s'] - df['q3_time_s']
     df['best_q_vs_fp3_improvement'] = df['fp3_best_s'] - df['best_q_time_s']
     
     final_cols = ['Driver', 'fp3_best_s', 'best_q_time_s', 'q3_vs_fp3_improvement', 'best_q_vs_fp3_improvement']
     
-    # Sort by who found the most time
     return df[final_cols].sort_values('best_q_vs_fp3_improvement', ascending=False).reset_index(drop=True)
 
 def get_best_quali_relative_sector(year: int, gp: str) -> pd.DataFrame:
@@ -1758,13 +1620,11 @@ def get_best_quali_relative_sector(year: int, gp: str) -> pd.DataFrame:
     4. Determines which sector had the smallest delta (their relatively best sector).
     """
     q_session = fastf1.get_session(year, gp, 'Q')
-    # Telemetry is needed to get precise sector times for every lap
     q_session.load(telemetry=False, weather=False, messages=False)
 
     laps = q_session.laps.copy()
     all_drivers = laps['Driver'].unique()
 
-    # Filter for valid push laps (ignoring in/out laps)
     valid_laps = laps[
         (laps['TrackStatus'] == '1') &
         (laps['PitOutTime'].isna()) &
@@ -1778,31 +1638,24 @@ def get_best_quali_relative_sector(year: int, gp: str) -> pd.DataFrame:
     if valid_laps.empty:
         return pd.DataFrame({'Driver': all_drivers, 'quali_best_relative_sector': 'NONE'})
 
-    # 1. Find the absolute best lap for each driver
     best_lap_idx = valid_laps.groupby('Driver')['LapTime'].idxmin()
     best_laps = valid_laps.loc[best_lap_idx].copy()
 
-    # 2. Extract sector times in seconds
     best_laps['s1_s'] = best_laps['Sector1Time'].dt.total_seconds()
     best_laps['s2_s'] = best_laps['Sector2Time'].dt.total_seconds()
     best_laps['s3_s'] = best_laps['Sector3Time'].dt.total_seconds()
 
-    # 3. Find the absolute fastest time for each sector in the entire session
     fastest_s1 = best_laps['s1_s'].min()
     fastest_s2 = best_laps['s2_s'].min()
     fastest_s3 = best_laps['s3_s'].min()
 
-    # 4. Calculate relative deltas (Driver Sector Time - Fastest Sector Time)
     best_laps['s1_delta'] = best_laps['s1_s'] - fastest_s1
     best_laps['s2_delta'] = best_laps['s2_s'] - fastest_s2
     best_laps['s3_delta'] = best_laps['s3_s'] - fastest_s3
 
-    # 5. Determine the best relative sector (the one with the smallest delta)
-    # We use idxmin along the delta columns to find the column name
     sector_delta_cols = ['s1_delta', 's2_delta', 's3_delta']
     best_laps['best_relative_sector_col'] = best_laps[sector_delta_cols].idxmin(axis=1)
 
-    # Clean up the output to just 'S1', 'S2', 'S3'
     sector_map = {
         's1_delta': 'S1',
         's2_delta': 'S2',
@@ -1810,112 +1663,13 @@ def get_best_quali_relative_sector(year: int, gp: str) -> pd.DataFrame:
     }
     best_laps['quali_best_relative_sector'] = best_laps['best_relative_sector_col'].map(sector_map)
 
-    # Prepare final DataFrame
     final_cols = ['Driver', 'quali_best_relative_sector', 's1_delta', 's2_delta', 's3_delta']
     result = best_laps[final_cols]
     
-    # Ensure all drivers are present, even if they had no valid laps
     df_all = pd.DataFrame({'Driver': all_drivers})
     df_final = df_all.merge(result, on='Driver', how='left')
     df_final['quali_best_relative_sector'] = df_final['quali_best_relative_sector'].fillna('NONE')
 
-    # Sort to show who dominated each sector
     return df_final.sort_values(['quali_best_relative_sector', 's1_delta']).reset_index(drop=True)
 
-# if __name__ == '__main__':
-#     TARGET_SESSION = 'FP2'
     
-#     df_best = get_best_lap_delta(2026, 'Japan', TARGET_SESSION)
-#     print(df_best.to_string(index=False))
-    
-#     df_clean = get_clean_laps_count(2026, 'Japan', TARGET_SESSION)
-#     print(df_clean.to_string(index=False))
-    
-#     df_avg = get_compound_avg(2026, 'Japan', TARGET_SESSION, compound='HARD')
-#     print(df_avg.to_string(index=False))
-    
-#     df_sectors = get_sector_deltas(2026, 'Japan', TARGET_SESSION)
-#     print(df_sectors.to_string(index=False))
-    
-#     df_speed = get_max_speed_trap(2026, 'Japan', TARGET_SESSION)
-#     print(df_speed.to_string(index=False))
-    
-#     df_laps_hard = get_laps_on_compound(2026, 'Japan', TARGET_SESSION, compound='HARD')
-#     print(df_laps_hard.to_string(index=False))
-    
-#     df_longrun_vg = get_longrun_avg_pace(2026,'Japan',TARGET_SESSION)
-#     print(df_longrun_vg)
-    
-#     df_longrun_deg_rate = get_longrun_deg_rate(2026,'Japan',TARGET_SESSION, compound='HARD')
-#     print(df_longrun_deg_rate)
-    
-#     df_deg_total = get_longrun_deg_total(2026, 'Japan', TARGET_SESSION, compound='MEDIUM', min_laps=5, expected_stint_length=18)
-#     print(df_deg_total.to_string(index=False))
-    
-#     df_consistency = get_longrun_consistency(2026, 'Japan', TARGET_SESSION, compound='HARD', min_laps=5)
-#     print("FP2 Long Run Consistency (Standard Deviation in seconds):")
-#     print(df_consistency.to_string(index=False))
-    
-#     df_compound = get_longrun_compound(2026, 'Japan', TARGET_SESSION, min_laps=5)
-#     print("FP2 Long Run Primary Compound:")
-#     print(df_compound.to_string(index=False))
-    
-#     df_fuel_pace = get_fuel_corrected_pace(2026, 'Japan', TARGET_SESSION, compound='MEDIUM', window_size=5)
-#     print("FP2 Fuel Corrected Base Pace (0kg Fuel Equivalent):")
-#     print(df_fuel_pace.to_string(index=False))
-    
-#     df_ers = get_ers_efficiency_proxy(2026, 'Japan', TARGET_SESSION)
-#     print("FP2 ERS Efficiency Proxy (Delta vs Field):")
-#     print(df_ers.to_string(index=False))
-    
-#     df_lc = get_lift_and_coast_laps(2026, 'Japan', TARGET_SESSION, min_laps=5)
-#     print("FP2 Average Lift & Coast Time per Lap (Seconds):")
-#     print(df_lc.to_string(index=False))
-
-#     df_speed_var = get_speed_trap_variance(2026, 'Japan', TARGET_SESSION, min_laps=5)
-#     print("FP2 Speed Trap Variance (km/h) during Long Runs:")
-#     print(df_speed_var.to_string(index=False))
-
-#     df_sector_imp = get_sector_improvement_vs_fp2(2026, 'Japan', compound='SOFT')
-#     print("Overnight Sector Improvement (Seconds gained per sector vs FP2):")
-#     print(df_sector_imp.to_string(index=False))
-        
-#     df_qualy_sim = get_qualy_sim_delta(2026, 'Japan', TARGET_SESSION, compound='SOFT')
-#     print("FP3 Qualy Sim Pace (Delta to Leader):")
-#     print(df_qualy_sim.to_string(index=False))
-    
-#     df_improvement = get_fp3_vs_fp2_improvement(2026, 'Japan', compound='SOFT')
-#     print("Overnight Setup Improvement (Seconds gained from FP2 to FP3):")
-#     print(df_improvement.to_string(index=False))
-    
-#     df_pu = get_pu_deployment_asymmetry(2026, 'Japan', TARGET_SESSION)
-#     print("FP2 S1 vs S3 Ratio (PU Deployment Asymmetry):")
-#     print(df_pu.to_string(index=False))
-    
-#     df_tyre = get_fp3_qualy_sim_context(2026, 'Japan', TARGET_SESSION)
-#     print("FP3 Best Lap Tyre Compound:")
-#     print(df_tyre.to_string(index=False))
-    
-#     df_evo = get_track_evolution(2026, 'Japan', TARGET_SESSION)
-#     print("FP3 Global Track Evolution (Seconds):")
-#     print(df_evo.head(5).to_string(index=False))
-    
-#     df_grid = get_grid_position_features(2026, 'Japan', TARGET_SESSION)
-#     print("Final Grid Position Features for ML:")
-#     print(df_grid.head(21).to_string(index=False))
-    
-#     df_qualy = get_qualy_deltas(2026, 'Japan')
-#     print("Qualifying Deltas to Pole Position (Seconds):")
-#     print(df_qualy.head(15).to_string(index=False))
-    
-#     df_q3_flag = get_q3_participation_flag(2026, 'Japan')
-#     print("Q3 Participation Flag (1 = Yes, 0 = No):")
-#     print(df_q3_flag.head(15).to_string(index=False))
-    
-#     df_jump = get_qualy_vs_fp3_improvement(2026, 'Japan')
-#     print("Time Found from FP3 to Qualifying (Seconds):")
-#     print(df_jump.head(15).to_string(index=False))
-    
-#     df_best_sector = get_best_quali_relative_sector(2026, 'Japan')
-#     print("Best Relative Sector in Qualifying:")
-#     print(df_best_sector.to_string(index=False))

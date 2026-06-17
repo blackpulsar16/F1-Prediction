@@ -1,12 +1,13 @@
 [project]
 name = "f1"
 version = "0.1.0"
-description = "Add your description here"
+description = "XGBRanker-based F1 race prediction pipeline using FastF1 telemetry features — 2026 season"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastf1>=3.8.3",
     "lightgbm>=4.6.0",
+    "rich>=15.0.0",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "xgboost>=3.2.0",
